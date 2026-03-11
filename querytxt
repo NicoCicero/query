@@ -1,0 +1,36 @@
+SELECT
+    s.name AS schema_name,
+    o.name AS object_name,
+    CASE o.type
+        WHEN 'U' THEN 'TABLE'
+        WHEN 'V' THEN 'VIEW'
+        WHEN 'P' THEN 'STORED PROCEDURE'
+        WHEN 'FN' THEN 'SCALAR FUNCTION'
+        WHEN 'TF' THEN 'TABLE FUNCTION'
+        WHEN 'IF' THEN 'INLINE FUNCTION'
+        WHEN 'TR' THEN 'TRIGGER'
+        ELSE o.type_desc
+    END AS object_type,
+    o.create_date,
+    o.modify_date
+FROM sys.objects o
+JOIN sys.schemas s ON o.schema_id = s.schema_id
+WHERE o.is_ms_shipped = 0
+ORDER BY object_type, o.name;
+ 
+ 
+SELECT
+    s.name AS schema_name,
+    t.name AS table_name,
+    c.column_id,
+    c.name AS column_name,
+    ty.name AS data_type,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.columns c ON t.object_id = c.object_id
+JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+ORDER BY s.name, t.name, c.column_id;
