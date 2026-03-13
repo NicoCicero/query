@@ -1,3 +1,460 @@
+USE [emt_desarrollo]					
+GO					
+/****** Object:  StoredProcedure [dbo].[wf_p_out_cartera_en_gestion]    Script Date: 09/02/2026 10:51:00 ******/					
+SET ANSI_NULLS ON					
+GO					
+SET QUOTED_IDENTIFIER ON					
+GO					
+					
+ALTER PROCEDURE [dbo].[wf_p_out_cartera_en_gestion] (@v_cod_ret INT OUT)					
+AS					
+SET NOCOUNT ON					
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED					
+					
+--DECLARE @v_cod_ret INT 					
+DECLARE @aanio INT					
+DECLARE @ames INT					
+DECLARE @aanioant INT					
+DECLARE @amesant INT					
+DECLARE @cambio NUMERIC(9, 5)					
+--DECLARE @fecProceso DATETIME					
+DECLARE @fecProceso char(8)  					
+DECLARE @prc_nombre_corto VARCHAR(10)					
+DECLARE @fecha_proceso DATETIME					
+DECLARE @fecha_mes DATETIME					
+DECLARE @primerdiames VARCHAR(10)					
+DECLARE @usu_id INT					
+DECLARE @cant INT					
+DECLARE @parametro_causales VARCHAR(4000)					
+DECLARE @causales TABLE (causal VARCHAR(5))					
+					
+------------------------------------------SETEO DE VARIABLES----------------------------------------------					
+SELECT TOP 1 @cambio = tca_valor					
+FROM tipos_cambios					
+WHERE tca_mon = 2					
+ORDER BY tca_fecha DESC					
+					
+SELECT @fecProceso = prt_valor					
+FROM wf_parametros					
+WHERE prt_nombre_corto = 'FECPRO'					
+					
+SELECT TOP 1 @aanio = SUBSTRING(LTRIM(convert(VARCHAR(8), ab.prt_valor, 112)), 1, 4)					
+FROM wf_parametros AS ab					
+WHERE prt_nombre_corto = 'FECPRO'					
+					
+SELECT TOP 1 @ames = convert(INT, SUBSTRING(LTRIM(convert(VARCHAR(8), ab.prt_valor, 112)), 5, 2))					
+FROM wf_parametros AS ab					
+WHERE prt_nombre_corto = 'FECPRO'					
+					
+SELECT TOP 1 @aanioant = SUBSTRING(LTRIM(convert(VARCHAR(8), DATEADD(MM, - 1, ab.prt_valor), 112)), 1, 4)					
+FROM wf_parametros AS ab					
+WHERE prt_nombre_corto = 'FECPRO'					
+					
+SELECT TOP 1 @amesant = convert(INT, SUBSTRING(LTRIM(convert(VARCHAR(8), DATEADD(MM, - 1, ab.prt_valor), 112)), 5, 2))					
+FROM wf_parametros AS ab					
+WHERE prt_nombre_corto = 'FECPRO'					
+					
+IF @fecProceso IS NULL					
+	OR ISDATE(@fecProceso) = 0				
+BEGIN					
+	SET @fecProceso = (				
+			SELECT CONVERT(VARCHAR(10), prt_valor)		
+			FROM wf_parametros		
+			WHERE prt_nombre_corto = 'FECPRO'		
+			)		
+END					
+					
+SET @fecha_mes = @fecProceso					
+SET @primerdiames = CONVERT(VARCHAR(25), DATEADD(dd, - (DAY(@fecha_mes) - 1), @fecha_mes), 102)					
+SET @prc_nombre_corto = 'OUT_CATGES'					
+SET @usu_id = ISNULL(@usu_id, 1)					
+---------------------------------------------PARAMETROS ------------------------------------------					
+SET @parametro_causales = (					
+		SELECT prt_valor			
+		FROM wf_parametros			
+		WHERE prt_nombre_corto = 'CAUSAL_CEG'			
+			AND prt_baja_fecha IS NULL		
+		)			
+					
+INSERT INTO @causales					
+SELECT item					
+FROM dbo.emx_f_split_max(@parametro_causales, ',')					
+WHERE item <> ''					
+					
+---------------------------------------------- INICIO DE PROCESO ---------------------------------------------------					
+INSERT wf_print_out					
+SELECT @prc_nombre_corto					
+	,GETDATE()				
+	,isnull(@fecProceso, GETDATE())				
+	,'I'				
+	,'PROCESO GENERACION ARCHIVO ' + @prc_nombre_corto + ' - INICIADO. ' + CONVERT(CHAR(17), GETDATE(), 113)				
+	,@usu_id				
+	,isnull(@v_cod_ret, 0)				
+	,NULL				
+					
+----------------------------------------------------Verifica parametros------------------------------------------------------------					
+--	VERIFICA FECHA DE PROCESO				
+IF @fecProceso IS NULL					
+	OR ISDATE(@fecProceso) = 0				
+BEGIN					
+	INSERT wf_print_out				
+	SELECT @prc_nombre_corto				
+		,GETDATE()			
+		,GETDATE()			
+		,'E'			
+		,'PROCESO ABORTADO - No existe fecha de proceso ' + CONVERT(CHAR(20), GETDATE(), 113)			
+		,@usu_id			
+		,NULL			
+		,NULL			
+					
+	SET @v_cod_ret = - 1000				
+					
+	RETURN				
+END					
+					
+IF NOT EXISTS (					
+		SELECT 1			
+		FROM @causales			
+		)			
+BEGIN					
+	INSERT wf_print_out				
+	SELECT @prc_nombre_corto				
+		,GETDATE()			
+		,GETDATE()			
+		,'E'			
+		,'PROCESO ABORTADO - No existe parametro CAUSALCEG ' + CONVERT(CHAR(20), GETDATE(), 113)			
+		,@usu_id			
+		,NULL			
+		,NULL			
+					
+	SET @v_cod_ret = - 1000				
+					
+	RETURN				
+END					
+					
+---------------------------------------------- TABLAS TEMPORALES ---------------------------------------					
+IF OBJECT_ID('tempdb..#ClienteAtraso') IS NOT NULL					
+	DROP TABLE #ClienteAtraso				
+					
+CREATE TABLE #ClienteAtraso (					
+	cliente VARCHAR(20) null				
+	,max_atraso INT null				
+	)				
+					
+INSERT INTO #ClienteAtraso					
+SELECT cliente					
+	,max(mora) AS max_atraso				
+FROM (					
+	SELECT xx.cta_cli AS cliente				
+		,mora = isnull(convert(INT, (@fecProceso) - (xx.cta_fec_vto)), 0)			
+	FROM cuentas AS xx				
+	) AS bb				
+GROUP BY cliente					
+					
+CREATE INDEX IX_Clientes_atraso_aux ON #ClienteAtraso (cliente)					
+					
+DECLARE @escenarios TABLE (_esc_id INT)					
+					
+INSERT INTO @escenarios					
+SELECT esc_id					
+FROM wf_escenarios --ON sob_esc = esc_id					
+WHERE  esc_cod = '0' 					
+ or (					
+        esc_baja_fecha IS NULL					
+	AND (				
+		ESC_COD NOT IN ('100')			
+		OR esc_nombre_corto IN (			
+			'CAA'		
+			,'CAE'		
+			,'CALAV'		
+			,'CAI'		
+			)		
+		)			
+      )					
+IF OBJECT_ID('tempdb..#regiones') IS NOT NULL					
+	DROP TABLE #regiones				
+					
+CREATE TABLE #regiones (					
+	are_nombre VARCHAR(50) NULL				
+	,rxs_suc VARCHAR(5) NULL				
+	)				
+					
+INSERT INTO #regiones					
+SELECT are_nombre					
+	,rxs_suc				
+FROM (					
+	SELECT ROW_NUMBER() OVER (				
+			PARTITION BY rxs_suc ORDER BY rxs_suc DESC		
+			) AS r		
+		,are_nombre			
+		,rxs_suc			
+	FROM add_reg_x_suc				
+	LEFT JOIN add_regiones ON rxs_reg = are_id				
+	WHERE rxs_baja_fecha IS NULL				
+		AND are_baja_fecha IS NULL			
+	) AS T				
+WHERE r = 1					
+					
+IF OBJECT_ID('tempdb..#divisiones') IS NOT NULL					
+	DROP TABLE #divisiones				
+					
+CREATE TABLE #divisiones (					
+	are_division VARCHAR(50) NULL				
+	,rxs_suc VARCHAR(5) NULL				
+	)				
+					
+INSERT INTO #divisiones					
+SELECT are_division					
+	,rxs_suc				
+FROM (					
+	SELECT ROW_NUMBER() OVER (				
+			PARTITION BY rxs_suc ORDER BY rxs_suc DESC		
+			) AS r		
+		,are_division			
+		,rxs_suc			
+	FROM add_reg_x_suc				
+	LEFT JOIN add_regiones ON rxs_reg = are_id				
+	WHERE rxs_baja_fecha IS NULL				
+		AND are_baja_fecha IS NULL			
+	) AS T				
+WHERE r = 1					
+					
+IF OBJECT_ID('tempdb..#cuits') IS NOT NULL					
+	DROP TABLE #cuits				
+					
+CREATE TABLE #cuits (					
+	pdc_nro VARCHAR(15) NULL				
+	,pdc_per INT NULL				
+	)				
+					
+INSERT INTO #cuits					
+SELECT pdc_nro					
+	,pdc_per				
+FROM (					
+	SELECT ROW_NUMBER() OVER (				
+			PARTITION BY pdc_per ORDER BY pdc_per DESC		
+			) AS r		
+		,pdc_nro			
+		,pdc_per			
+	FROM per_doc				
+	WHERE pdc_baja_fecha IS NULL				
+		AND pdc_tdc IN (			
+			35		
+			,36		
+			,37		
+			)		
+	) AS t				
+WHERE r = 1					
+					
+CREATE INDEX IX_CUITS_AUX ON #cuits (pdc_per)					
+					
+---------------------------------------------- ELIMINO CONTENIDO DE TABLA -------------------------------------------					
+TRUNCATE TABLE dbo.macro_cartera_en_gestion					
+					
+---------------------------------------------- INSERTO CABECERA DE TABLA -------------------------------------------					
+INSERT INTO dbo.macro_cartera_en_gestion					
+SELECT 'Fecha_foto'					
+	,'banca'				
+	,'seg1'				
+	,'segmento'				
+	,'sub_segmento'				
+	,'Cod_suc'				
+	,'Sucursal'				
+	,'Region'				
+	,'Division'				
+	,'cuit'				
+	,'Nro_cliente'				
+	,'Apellido'				
+	,'Nombre'				
+	,'Operacion'				
+	,'Operacion_Origen'				
+	,'Cod_producto'				
+	,'Producto'				
+	,'linea'				
+	,'Cod_moneda'				
+	,'Moneda'				
+	,'Dias_Mora'				
+	,'Deuda_vencida'				
+	,'Deuda_total'				
+	,'deuda_contable'				
+	,'Codigo_Escenario'				
+	,'Escenario'				
+	,'Estado'				
+	,'Agencia'				
+	,'Usu_nombre'				
+	,'Usu_apellido'				
+	,'Cartera'				
+	,'Score'				
+	,'Perdida_Esperada'				
+	,'Fecha_Perdida_Esperada'				
+	,'max_atraso'				
+	,'ACREDMES'				
+	,'MesAcred'				
+	,'ACREDMESANT'				
+	,'MesAcredAnt'				
+	,'Estado_Prestamo'				
+	,'TC_Fogar'				
+	,0				
+					
+-------------------------------------------INSERTO DATOS EN LA TABLA-----------------------------------------					
+INSERT INTO dbo.macro_cartera_en_gestion					
+SELECT 					
+--CONVERT(VARCHAR, @fecProceso, 111) AS Fecha_foto					
+        @fecProceso AS Fecha_foto					
+	,cnl_nombre AS banca				
+	,pea_texto6 AS seg1				
+	,cam_nombre_corto AS segmento				
+	,bnc_nombre_corto AS sub_segmento				
+	,suc_cod AS Cod_suc				
+	,suc_nombre AS Sucursal				
+	,AUX2.are_nombre AS Region				
+	,AUX3.are_division AS Division				
+	,isnull(AUX4.pdc_nro, 0) AS cuit				
+	,per_cli AS Nro_cliente				
+	,per_apellido AS Apellido				
+	,per_nombre AS Nombre				
+	,cta_num_oper AS Operacion				
+	,cta_gta_numero AS Operacion_Origen				
+	,cta_pro AS Cod_producto				
+	,pro_nombre AS Producto				
+	,cta_linea AS linea				
+	,cta_mon AS Cod_moneda				
+	,mon_nombre AS Moneda				
+	,(isnull(datediff(day, cta_fec_vto, @fecProceso), 0)) AS Dias_Mora				
+	,(				
+		cta_deuda_venc * (			
+			CASE 		
+				WHEN cta_mon = 2	
+					THEN @cambio
+				ELSE 1	
+				END	
+			)		
+		) AS Deuda_vencida			
+	,(				
+		(cta_deuda_venc + cta_deuda_a_venc) * (			
+			CASE 		
+				WHEN cta_mon = 2	
+					THEN @cambio
+				ELSE 1	
+				END	
+			)		
+		) AS Deuda_total			
+	,(				
+		cta_paq_precierre_deuda * (			
+			CASE 		
+				WHEN cta_mon = 2	
+					THEN @cambio
+				ELSE 1	
+				END	
+			)		
+		) AS deuda_contable			
+        ,esc_nombre_corto Codigo_Escenario					
+	,esc_nombre AS Escenario				
+	,est_nombre AS Estado				
+	,age_nombre AS Agencia				
+	,usu_nombre AS Usu_nombre				
+	,usu_apellido AS Usu_apellido				
+	,cat_nombre AS Cartera				
+	,scd_scr AS Score				
+	,scd_esp AS Perdida_Esperada				
+	,CONVERT(VARCHAR, (isnull(scd_modi_fecha, scd_alta_fecha)), 121) AS Fecha_Perdida_Esperada				
+	,max_atraso AS max_atraso				
+	,isnull((				
+			SELECT SUM(ain_monto)		
+			FROM add_ingmensual		
+			INNER JOIN @causales ON ain_causal = causal		
+			WHERE SUBSTRING(LTRIM(convert(VARCHAR(8), ain_fec_acred, 112)), 1, 4) = @aanio		
+				AND SUBSTRING(LTRIM(convert(VARCHAR(8), ain_fec_acred, 112)), 5, 2) = @ames	
+				AND ain_cli = cta_cli	
+			), 0) AS ACREDMES		
+	,(convert(VARCHAR(4), @aanio) + '/' + convert(CHAR(2), @ames)) AS MesAcred				
+	,isnull((				
+			SELECT SUM(ain_monto)		
+			FROM add_ingmensual		
+			INNER JOIN @causales ON ain_causal = causal		
+			WHERE SUBSTRING(LTRIM(convert(VARCHAR(8), ain_fec_acred, 112)), 1, 4) = @aanioant		
+				AND SUBSTRING(LTRIM(convert(VARCHAR(8), ain_fec_acred, 112)), 5, 2) = @amesant	
+				AND ain_cli = cta_cli	
+			), 0) AS ACREDMESANT		
+	,(convert(VARCHAR(4), @aanioant) + '/' + convert(CHAR(2), @amesant)) MesAcredAnt				
+	,isnull(ptm_estado, '') AS Estado_Prestamo				
+	--,CASE 	WHEN ast_cli IS NULL 	THEN 'N' ELSE 'S' 		END TC_Fogar
+    , isnull((select top 1  'S'  from Add_saldos_Tarjetas_fogar  WHERE  cta_cli = ast_cli), 'N' ) as TC_Fogar					
+	,1				
+	--,ROW_NUMBER() OVER (				
+	--	ORDER BY per_cli			
+	--	)			
+FROM cuentas					
+INNER JOIN #ClienteAtraso AS aa ON aa.cliente = cta_cli					
+	AND (				
+		cta_deuda_venc <> 0			
+		OR cta_deuda_a_venc <> 0			
+		OR cta_paq_precierre_deuda <> 0			
+		)			
+	AND cta_baja_fecha IS NULL				
+INNER JOIN wf_sit_objetos ON cta_id = sob_id					
+INNER JOIN wf_escenarios ON sob_esc = esc_id					
+INNER JOIN @escenarios ON esc_id = _esc_id					
+INNER JOIN wf_estados ON sob_est = est_id					
+INNER JOIN productos ON pro_id = cta_pro					
+INNER JOIN monedas ON cta_mon = mon_id					
+INNER JOIN agencias ON cta_age = age_id					
+INNER JOIN wf_usuarios ON sob_usu_res = usu_id					
+INNER JOIN personas ON cta_cli = per_cli					
+	AND per_ent = 1				
+LEFT JOIN #cuits AUX4 ON AUX4.pdc_per = per_id					
+LEFT JOIN add_personas_adic ON per_id = apa_id					
+LEFT JOIN camp_comer ON apa_segmento = cam_nombre_corto					
+	AND cam_ent = per_ent				
+	AND cam_baja_fecha IS NULL				
+INNER JOIN banca ON bnc_nombre_corto = apa_subsegmento					
+	AND bnc_baja_fecha IS NULL				
+INNER JOIN canales ON apa_banca_nueva = cnl_nombre_corto					
+	AND cnl_ent = per_ent				
+	AND cnl_baja_fecha IS NULL				
+LEFT JOIN sucursales ON per_suc = suc_id					
+LEFT JOIN #regiones AUX2 ON AUX2.rxs_suc = suc_cod					
+LEFT JOIN #divisiones AUX3 ON AUX3.rxs_suc = suc_cod					
+LEFT JOIN per_atributos ON pea_id = per_id					
+LEFT JOIN carteras ON cat_id = cta_cat					
+LEFT JOIN add_score_diario ON scd_cli = cta_cli					
+	AND scd_car = cta_cat				
+LEFT JOIN add_prestamos AS p ON cta_id = p.ptm_id					
+#¿NOMBRE?					
+					
+SET @cant = (					
+		SELECT COUNT(*)			
+		FROM dbo.macro_cartera_en_gestion			
+		)			
+					
+INSERT wf_print_out					
+SELECT @prc_nombre_corto					
+	,GETDATE()				
+	,@fecProceso				
+	,'A'				
+	,ISNULL('Cantidad de registros enviados: ' + CONVERT(VARCHAR, @cant), 'Sin información')				
+	,@usu_id				
+	,NULL				
+	,NULL				
+					
+INSERT wf_print_out					
+SELECT @prc_nombre_corto					
+	,GETDATE()				
+	,@fecProceso				
+	,'F'				
+	,ISNULL('PROCESO GENERACION ARCHIVO ' + @prc_nombre_corto + ' - FINALIZADO. ' + CONVERT(CHAR(17), GETDATE(), 113), 'Sin información')				
+	,@usu_id				
+	,@v_cod_ret				
+	,NULL				
+					
+SELECT @v_cod_ret = @@error					
+
+
+
+
+
+------------------------
+
 SELECT
     s.name AS schema_name,
     o.name AS object_name,
