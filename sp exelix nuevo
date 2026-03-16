@@ -1,0 +1,319 @@
+
+/*
+  Exelix - Banco Macro / Emerix
+  SP: operacional.wf_p_out_cartera_en_gestion
+  Genera el dataset para el archivo: emerix_cartera_en_gestion_yyyymmdd.txt
+  Formato esperado: TXT delimitado por '|'
+
+  Mapeo (según definición manual de Nico):
+    1 Fecha_foto        -> batch.bat_pparametros.fec_cierre
+    2 Codigo_Escenario  -> operacional.wfl_pescenarios.codigo
+    3 Nombre_Escenario  -> operacional.wfl_pescenarios.nombre
+    4 Cliente           -> operacional.per_tpersonas.numero_cliente
+    5 Cuenta            -> operacional.cta_tcuentas.numero_cuenta
+    6 Producto          -> operacional.emp_pproductos.nombre
+    7 Moneda            -> operacional.adm_pmonedas.nombre
+    8 Agencia           -> operacional.age_pagentes.nombre  (fallback: operacional.age_ptipos_agentes)
+    9 Responsable       -> seguridad.seg_tusuarios.nombre
+   10 Estado            -> operacional.wfl_pestados.nombre
+   11 Sucursal          -> operacional.emp_psucursales.nombre
+   12 Region            -> operacional.emp_pzonas.nombre
+   13 Division          -> NO mapeado (sale NULL)
+   14 Segmento          -> operacional.emp_psegmentos.nombre
+   15 Subsegmento       -> operacional.emp_psubsegmentos.nombre (fallback: emp_psub_segmentos)
+   16 Canal             -> operacional.z_canales.cnl_nombre (join condicional, ver notas)
+   17 Score             -> operacional.z_add_score_diario.scd_scr (join condicional por fecha)
+   18 Tipo_Cambio       -> operacional.adm_ttipos_cambio.valor (selección condicional)
+   19 CUIT              -> operacional.per_tdocumentos.numero (filtrado por tipo si existe per_ptipos_documentos)
+   20 TC_Fogar          -> EXISTS operacional.z_cta_tsaldos_tfogar (fallback: batch.z_cta_tsaldos_tfogar_origen)
+
+  NOTAS IMPORTANTES:
+  - Este SP arma wf_actual en base a la última asignación por objeto (wfl_tasignaciones)
+    y el puente cuenta<->objeto (wfl_tcta_objetos_proceso). Si la relación A/B difiere,
+    usar @wfJoinMode = 'A' o 'B'.
+  - Para Canal / Score / Tipo_Cambio se usan joins "best effort" con validación de columnas.
+    Si tu modelo usa otros campos, ajustá el bloque dinámico correspondiente.
+*/
+
+CREATE OR ALTER PROCEDURE operacional.wf_p_out_cartera_en_gestion
+    @fecProceso      date        = NULL,
+    @wfJoinMode      char(1)     = 'A',   -- 'A' o 'B' según relación cuenta<->objeto
+    @incluirSoloFogar bit        = 0      -- 1 = aplica filtro Fogar (EXISTS), 0 = no filtra
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /* 1) Determinar fecha de proceso (Fecha_foto) desde parámetros si no se envía */
+    IF @fecProceso IS NULL
+    BEGIN
+        IF OBJECT_ID('batch.bat_pparametros','U') IS NOT NULL
+            SELECT TOP 1 @fecProceso = CAST(fec_cierre AS date)
+            FROM batch.bat_pparametros
+            WHERE fec_cierre IS NOT NULL
+            ORDER BY fec_cierre DESC;
+        ELSE
+            SET @fecProceso = CAST(GETDATE() AS date);
+    END
+
+    /* 2) Resolver nombres reales de tablas que cambian entre ambientes */
+    DECLARE @tblAgencia sysname = CASE
+        WHEN OBJECT_ID('operacional.age_pagentes','U') IS NOT NULL THEN 'operacional.age_pagentes'
+        WHEN OBJECT_ID('operacional.age_ptipos_agentes','U') IS NOT NULL THEN 'operacional.age_ptipos_agentes'
+        ELSE NULL
+    END;
+
+    DECLARE @tblSubseg sysname = CASE
+        WHEN OBJECT_ID('operacional.emp_psubsegmentos','U') IS NOT NULL THEN 'operacional.emp_psubsegmentos'
+        WHEN OBJECT_ID('operacional.emp_psub_segmentos','U') IS NOT NULL THEN 'operacional.emp_psub_segmentos'
+        ELSE NULL
+    END;
+
+    DECLARE @tblFogar sysname = CASE
+        WHEN OBJECT_ID('operacional.z_cta_tsaldos_tfogar','U') IS NOT NULL THEN 'operacional.z_cta_tsaldos_tfogar'
+        WHEN OBJECT_ID('batch.z_cta_tsaldos_tfogar_origen','U') IS NOT NULL THEN 'batch.z_cta_tsaldos_tfogar_origen'
+        ELSE NULL
+    END;
+
+    /* 3) Construir filtro de escenarios (codigo='0' OR baja_fecha is null / baja=0) sin romper si no existe la columna */
+    DECLARE @escFiltro nvarchar(400) = N'(esc.codigo = ''0''';
+
+    IF COL_LENGTH('operacional.wfl_pescenarios','esc_baja_fecha') IS NOT NULL
+        SET @escFiltro += N' OR esc.esc_baja_fecha IS NULL';
+    ELSE IF COL_LENGTH('operacional.wfl_pescenarios','baja') IS NOT NULL
+        SET @escFiltro += N' OR esc.baja = 0';
+
+    SET @escFiltro += N')';
+
+    /* 4) JOIN dinámico a Canal (z_canales) - best effort
+          Intento: per_tpersonas.id_canal -> z_canales.id_canal / id_cnl / cnl_id
+    */
+    DECLARE @joinCanal nvarchar(max) = N'';
+    DECLARE @selCanal  nvarchar(200) = N'CAST(NULL AS varchar(60)) AS Canal';
+
+    IF OBJECT_ID('operacional.z_canales','U') IS NOT NULL
+    BEGIN
+        DECLARE @canalKeyPersonas sysname = NULL;
+        IF COL_LENGTH('operacional.per_tpersonas','id_canal') IS NOT NULL SET @canalKeyPersonas = 'id_canal';
+        IF COL_LENGTH('operacional.per_tpersonas','id_cnl')  IS NOT NULL AND @canalKeyPersonas IS NULL SET @canalKeyPersonas = 'id_cnl';
+
+        DECLARE @canalKeyTabla sysname = NULL;
+        IF COL_LENGTH('operacional.z_canales','id_canal') IS NOT NULL SET @canalKeyTabla = 'id_canal';
+        IF COL_LENGTH('operacional.z_canales','id_cnl')   IS NOT NULL AND @canalKeyTabla IS NULL SET @canalKeyTabla = 'id_cnl';
+        IF COL_LENGTH('operacional.z_canales','cnl_id')   IS NOT NULL AND @canalKeyTabla IS NULL SET @canalKeyTabla = 'cnl_id';
+
+        IF @canalKeyPersonas IS NOT NULL AND @canalKeyTabla IS NOT NULL
+        BEGIN
+            SET @joinCanal = N'
+LEFT JOIN operacional.z_canales cnl ON cnl.' + QUOTENAME(@canalKeyTabla) + N' = p.' + QUOTENAME(@canalKeyPersonas);
+            IF COL_LENGTH('operacional.z_canales','cnl_nombre') IS NOT NULL
+                SET @selCanal = N'CAST(cnl.cnl_nombre AS varchar(60)) AS Canal';
+            ELSE IF COL_LENGTH('operacional.z_canales','nombre') IS NOT NULL
+                SET @selCanal = N'CAST(cnl.nombre AS varchar(60)) AS Canal';
+        END
+    END
+
+    /* 5) JOIN dinámico a Score (z_add_score_diario) - best effort
+          Intento: id_persona + (foto_fecha = @fecProceso) si existe.
+    */
+    DECLARE @joinScore nvarchar(max) = N'';
+    DECLARE @selScore  nvarchar(200) = N'CAST(NULL AS varchar(30)) AS Score';
+
+    IF OBJECT_ID('operacional.z_add_score_diario','U') IS NOT NULL
+    BEGIN
+        SET @joinScore = N'
+LEFT JOIN operacional.z_add_score_diario sc ON sc.id_persona = p.id_persona';
+        IF COL_LENGTH('operacional.z_add_score_diario','foto_fecha') IS NOT NULL
+            SET @joinScore += N' AND sc.foto_fecha = @fecProceso';
+        ELSE IF COL_LENGTH('operacional.z_add_score_diario','scd_fecha_proceso') IS NOT NULL
+            SET @joinScore += N' AND sc.scd_fecha_proceso = @fecProceso';
+
+        IF COL_LENGTH('operacional.z_add_score_diario','scd_scr') IS NOT NULL
+            SET @selScore = N'CAST(sc.scd_scr AS varchar(30)) AS Score';
+    END
+
+    /* 6) Tipo de cambio - best effort
+          Si existe adm_ttipos_cambio: tomar TOP 1 valor <= @fecProceso (por fecha) o el último.
+          Ojo: ajustar a tu esquema real (id_moneda_origen/destino, etc.).
+    */
+    DECLARE @selTC nvarchar(400) = N'CAST(NULL AS varchar(30)) AS Tipo_Cambio';
+    IF OBJECT_ID('operacional.adm_ttipos_cambio','U') IS NOT NULL
+    BEGIN
+        IF COL_LENGTH('operacional.adm_ttipos_cambio','valor') IS NOT NULL
+        BEGIN
+            IF COL_LENGTH('operacional.adm_ttipos_cambio','fecha') IS NOT NULL
+                SET @selTC = N'CAST((SELECT TOP 1 tc.valor FROM operacional.adm_ttipos_cambio tc WHERE tc.fecha <= @fecProceso ORDER BY tc.fecha DESC) AS varchar(30)) AS Tipo_Cambio';
+            ELSE IF COL_LENGTH('operacional.adm_ttipos_cambio','fec') IS NOT NULL
+                SET @selTC = N'CAST((SELECT TOP 1 tc.valor FROM operacional.adm_ttipos_cambio tc WHERE tc.fec <= @fecProceso ORDER BY tc.fec DESC) AS varchar(30)) AS Tipo_Cambio';
+            ELSE
+                SET @selTC = N'CAST((SELECT TOP 1 tc.valor FROM operacional.adm_ttipos_cambio tc ORDER BY tc.alta_fecha DESC) AS varchar(30)) AS Tipo_Cambio';
+        END
+    END
+
+    /* 7) CUIT - si existe per_ptipos_documentos, filtrar por CUIT/CUIL/CDI; si no, tomar el MAX(numero) */
+    DECLARE @cuitApply nvarchar(max) = N'';
+    DECLARE @selCuit  nvarchar(200) = N'CAST(NULL AS varchar(30)) AS CUIT';
+
+    IF OBJECT_ID('operacional.per_tdocumentos','U') IS NOT NULL
+    BEGIN
+        IF OBJECT_ID('operacional.per_ptipos_documentos','U') IS NOT NULL
+        BEGIN
+            SET @cuitApply = N'
+OUTER APPLY (
+    SELECT TOP 1 d.numero AS cuit
+    FROM operacional.per_tdocumentos d
+    JOIN operacional.per_ptipos_documentos td ON td.id_tipo_documento = d.id_tipo_documento
+    WHERE d.baja = 0 AND d.id_persona = p.id_persona AND td.codigo IN (''CUIT'',''CUIL'',''CDI'')
+    ORDER BY d.prioridad DESC, d.alta_fecha DESC
+) doc';
+        END
+        ELSE
+        BEGIN
+            SET @cuitApply = N'
+OUTER APPLY (
+    SELECT TOP 1 d.numero AS cuit
+    FROM operacional.per_tdocumentos d
+    WHERE d.baja = 0 AND d.id_persona = p.id_persona
+    ORDER BY d.alta_fecha DESC
+) doc';
+        END
+        SET @selCuit = N'CAST(doc.cuit AS varchar(30)) AS CUIT';
+    END
+
+    /* 8) Fogar flag */
+    DECLARE @selFogar nvarchar(300) = N'''N'' AS TC_Fogar';
+    DECLARE @whereFogar nvarchar(300) = N'';
+    IF @tblFogar IS NOT NULL
+    BEGIN
+        SET @selFogar = N'ISNULL((SELECT TOP 1 ''S'' FROM ' + @tblFogar + N' tf WHERE tf.id_persona = p.id_persona), ''N'') AS TC_Fogar';
+        IF @incluirSoloFogar = 1
+            SET @whereFogar = N' AND EXISTS (SELECT 1 FROM ' + @tblFogar + N' tf2 WHERE tf2.id_persona = p.id_persona)';
+    END
+
+    /* 9) Armar wf_actual según modo A/B */
+    DECLARE @wfJoin nvarchar(max);
+
+    IF @wfJoinMode = 'B'
+    BEGIN
+        SET @wfJoin = N'
+    wf_actual AS (
+        SELECT
+            c.id_cuenta,
+            ua.id_objeto,
+            ua.id_persona,
+            ua.id_workflow,
+            ua.id_escenario,
+            ua.id_estado,
+            ua.id_agente,
+            ua.id_usuario
+        FROM ult_asig ua
+        JOIN operacional.wfl_tcta_objetos_proceso p
+          ON p.id_objeto = ua.id_objeto
+         AND p.id_persona = ua.id_persona
+        JOIN operacional.cta_tcuentas c
+          ON c.clave_ext = CAST(p.id_objeto_gestion AS varchar(50))
+        WHERE ua.rn = 1
+    )';
+    END
+    ELSE
+    BEGIN
+        SET @wfJoin = N'
+    wf_actual AS (
+        SELECT
+            c.id_cuenta,
+            ua.id_objeto,
+            ua.id_persona,
+            ua.id_workflow,
+            ua.id_escenario,
+            ua.id_estado,
+            ua.id_agente,
+            ua.id_usuario
+        FROM ult_asig ua
+        JOIN operacional.wfl_tcta_objetos_proceso p
+          ON p.id_objeto_gestion = ua.id_objeto
+         AND p.id_persona = ua.id_persona
+        JOIN operacional.cta_tcuentas c
+          ON c.clave_ext = CAST(p.id_objeto AS varchar(50))
+        WHERE ua.rn = 1
+    )';
+    END
+
+    /* 10) SQL final */
+    DECLARE @sql nvarchar(max) = N'
+WITH ult_asig AS (
+    SELECT
+        a.id_objeto,
+        a.id_persona,
+        a.id_workflow,
+        a.id_escenario,
+        a.id_estado,
+        a.id_agente,
+        a.id_usuario,
+        a.fecha_estado,
+        a.fecha,
+        ROW_NUMBER() OVER (PARTITION BY a.id_objeto ORDER BY ISNULL(a.fecha_estado,a.fecha) DESC, a.id_asignacion DESC) AS rn
+    FROM operacional.wfl_tasignaciones a
+    WHERE a.baja = 0
+),'
++ @wfJoin + N'
+SELECT
+    /*  1 */ CAST(CONVERT(varchar(10), @fecProceso, 112) AS varchar(10)) AS Fecha_foto,
+    /*  2 */ CAST(esc.codigo AS varchar(20)) AS Codigo_Escenario,
+    /*  3 */ CAST(esc.nombre AS varchar(60)) AS Nombre_Escenario,
+    /*  4 */ CAST(p.numero_cliente AS varchar(20)) AS Cliente,
+    /*  5 */ CAST(c.numero_cuenta AS varchar(50)) AS Cuenta,
+    /*  6 */ CAST(prod.nombre AS varchar(60)) AS Producto,
+    /*  7 */ CAST(mon.nombre AS varchar(60)) AS Moneda,
+    /*  8 */ CAST(age.nombre AS varchar(60)) AS Agencia,
+    /*  9 */ CAST(u.nombre AS varchar(60)) AS Responsable,
+    /* 10 */ CAST(est.nombre AS varchar(60)) AS Estado,
+    /* 11 */ CAST(suc.nombre AS varchar(60)) AS Sucursal,
+    /* 12 */ CAST(zon.nombre AS varchar(60)) AS Region,
+    /* 13 */ CAST(NULL AS varchar(60)) AS Division,
+    /* 14 */ CAST(seg.nombre AS varchar(20)) AS Segmento,
+    /* 15 */ CAST(subseg.nombre AS varchar(20)) AS Subsegmento,
+    /* 16 */ ' + @selCanal + N',
+    /* 17 */ ' + @selScore + N',
+    /* 18 */ ' + @selTC + N',
+    /* 19 */ ' + @selCuit + N',
+    /* 20 */ ' + @selFogar + N'
+FROM wf_actual wf
+JOIN operacional.cta_tcuentas c
+  ON c.id_cuenta = wf.id_cuenta AND c.baja = 0
+JOIN operacional.per_tpersonas p
+  ON p.id_persona = c.id_persona AND p.baja = 0
+LEFT JOIN operacional.wfl_pescenarios esc
+  ON esc.id_escenario = wf.id_escenario
+LEFT JOIN operacional.wfl_pestados est
+  ON est.id_estado = wf.id_estado
+LEFT JOIN ' + @tblAgencia + N' age
+  ON age.' + CASE WHEN @tblAgencia LIKE '%age_ptipos_agentes' THEN 'id_tipo_agente' ELSE 'id_agente' END + N' = wf.id_agente
+LEFT JOIN seguridad.seg_tusuarios u
+  ON u.id_usuario = wf.id_usuario AND u.baja = 0
+LEFT JOIN operacional.emp_pproductos prod
+  ON prod.id_producto = c.id_producto AND prod.baja = 0
+LEFT JOIN operacional.adm_pmonedas mon
+  ON mon.id_moneda = c.id_moneda AND mon.baja = 0
+LEFT JOIN operacional.emp_psucursales suc
+  ON suc.id_sucursal = c.id_sucursal AND suc.baja = 0
+LEFT JOIN operacional.emp_pzonas zon
+  ON zon.id_zona = suc.id_zona AND zon.baja = 0
+LEFT JOIN operacional.emp_psegmentos seg
+  ON seg.id_segmento = p.id_segmento AND seg.baja = 0
+LEFT JOIN ' + @tblSubseg + N' subseg
+  ON subseg.' + CASE WHEN @tblSubseg LIKE '%emp_psub_segmentos' THEN 'id_sub_segmento' ELSE 'id_subsegmento' END + N' = p.id_sub_segmento AND subseg.baja = 0'
++ @joinCanal
++ @joinScore
++ @cuitApply + N'
+WHERE ' + @escFiltro + @whereFogar + N'
+ORDER BY p.numero_cliente, c.numero_cuenta;';
+
+    /* Validaciones mínimas antes de ejecutar */
+    IF @tblAgencia IS NULL
+        THROW 50001, 'No se encontró tabla de Agencia (operacional.age_pagentes ni operacional.age_ptipos_agentes).', 1;
+
+    IF @tblSubseg IS NULL
+        THROW 50002, 'No se encontró tabla de Subsegmentos (operacional.emp_psubsegmentos ni operacional.emp_psub_segmentos).', 1;
+
+    EXEC sp_executesql @sql, N'@fecProceso date', @fecProceso=@fecProceso;
+END
+GO
